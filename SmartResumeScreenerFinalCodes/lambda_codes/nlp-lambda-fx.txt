@@ -1,0 +1,200 @@
+import boto3
+import json
+from datetime import datetime
+import re
+
+# AWS clients
+s3 = boto3.client('s3')
+textract = boto3.client('textract')
+dynamodb = boto3.resource('dynamodb')
+sns = boto3.client('sns')
+
+# Constants
+PROCESSED_FOLDER = "processed-resumes/"
+DDB_TABLE_NAME = "ResumeUploads"
+
+# Replace with your IAM role and SNS topic ARNs
+TEXTRACT_ROLE_ARN = "arn:aws:iam::630610926728:role/textADmin"
+TEXTRACT_SNS_TOPIC_ARN = "arn:aws:sns:us-east-1:630610926728:NewResumeTopic"
+
+# Output bucket for processed JSON
+OUTPUT_BUCKET = "processed-resume-bucket-next"
+
+def lambda_handler(event, context):
+    """Lambda triggered by SNS for resume upload or Textract completion"""
+    try:
+        sns_record = event['Records'][0]['Sns']
+        message = json.loads(sns_record['Message'])
+    except Exception as e:
+        print(f"Invalid SNS message: {e}")
+        return {"status": "error", "message": "Invalid SNS message"}
+
+    # Textract completion message
+    if "JobId" in message:
+        job_id = message["JobId"]
+        status = message.get("Status", "")
+        if status != "SUCCEEDED":
+            print(f"Textract job {job_id} failed or incomplete")
+            return {"status": "error", "message": "Textract job failed"}
+        return process_textract_job(job_id)
+    
+    # S3 upload message
+    bucket = message.get('s3_bucket')
+    key = message.get('file_name')
+    if not bucket or not key:
+        print(f"Missing bucket or key in message: {message}")
+        return {"status": "error", "message": "Invalid S3 upload message"}
+
+    # Validate S3 object exists
+    if not validate_s3_object(bucket, key):
+        return {"status": "error", "message": "S3 object does not exist or inaccessible"}
+
+    # Validate SNS topic exists
+    if not validate_sns_topic(TEXTRACT_SNS_TOPIC_ARN):
+        return {"status": "error", "message": "SNS topic does not exist or inaccessible"}
+
+    print(f"Starting Textract job for {key} in bucket {bucket}")
+    start_textract_job(bucket, key)
+    return {"status": "started", "message": f"Textract job started for {key}"}
+
+# --- Helper functions ---
+
+def validate_s3_object(bucket, key):
+    """Check that the S3 object exists and is readable"""
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        return True
+    except Exception as e:
+        print(f"S3 validation failed for {bucket}/{key}: {e}")
+        return False
+
+def validate_sns_topic(topic_arn):
+    """Check that the SNS topic exists"""
+    try:
+        sns.get_topic_attributes(TopicArn=topic_arn)
+        return True
+    except Exception as e:
+        print(f"SNS topic validation failed: {e}")
+        return False
+
+def start_textract_job(bucket, key):
+    """Start an async Textract job for a PDF/image"""
+    if not key.lower().endswith(('.pdf', '.png', '.jpg', '.jpeg', '.tiff')):
+        print(f"Unsupported file type: {key}")
+        return
+    try:
+        textract.start_document_text_detection(
+            DocumentLocation={'S3Object': {'Bucket': bucket, 'Name': key}},
+            NotificationChannel={
+                'RoleArn': TEXTRACT_ROLE_ARN,
+                'SNSTopicArn': TEXTRACT_SNS_TOPIC_ARN
+            }
+        )
+        print(f"Textract job started for {key}")
+    except Exception as e:
+        print(f"Textract start job failed: {e}")
+
+def process_textract_job(job_id):
+    """Fetch Textract result and store structured data in S3 and DynamoDB"""
+    try:
+        result = textract.get_document_text_detection(JobId=job_id)
+    except Exception as e:
+        print(f"Error fetching Textract result: {e}")
+        return {"status": "error", "message": "Failed to get Textract result"}
+
+    blocks = result.get('Blocks', [])
+    doc_content = " ".join([b.get('Text', '') for b in blocks if b.get('BlockType') == 'LINE'])
+    if not doc_content:
+        print(f"No text extracted from Textract job {job_id}")
+        return {"status": "error", "message": "Empty document content"}
+
+    # Extract emails and phone numbers
+    emails = extract_emails(doc_content)
+    phone_numbers = extract_phone_numbers(doc_content)
+
+    # --- Skills Extraction ---
+    skills_section = re.search(r'TECHNICAL SKILLS(.*?)(?:PROFESSIONAL EXPERIENCE|CERTIFICATIONS|PROJECTS|EDUCATION)', doc_content, re.S | re.I)
+    skills = []
+    if skills_section:
+        text = skills_section.group(1)
+        for line in text.split('\n'):
+            parts = re.split(r'[:,]', line)
+            for part in parts[1:]:
+                part = part.strip()
+                if part:
+                    skills.append(part)
+
+    # --- Experience Extraction ---
+    experience_section = re.search(r'PROFESSIONAL EXPERIENCE(.*?)(?:CERTIFICATIONS|PROJECTS|EDUCATION)', doc_content, re.S | re.I)
+    experience = []
+    if experience_section:
+        exp_text = experience_section.group(1).strip()
+        # Capture job entries
+        job_matches = re.findall(r'([^\d\n]+)\s+([A-Za-z ]+)\s+I\s+([A-Za-z0-9\s\-]+)\s+(Built .*?)(?=(?:[A-Z]{2,}|$))', exp_text, re.S)
+        for match in job_matches:
+            experience.append({
+                'title': match[0].strip(),
+                'company': match[1].strip(),
+                'duration': match[2].strip(),
+                'description': match[3].strip()
+            })
+
+    # --- Education Extraction ---
+    education_section = re.search(r'EDUCATION(.*)', doc_content, re.S | re.I)
+    education = []
+    if education_section:
+        edu_text = education_section.group(1).strip()
+        edu_match = re.match(r'(.+?)\s+([A-Za-z0-9\s\-]+)\s+(.+)', edu_text)
+        if edu_match:
+            education.append({
+                'university': edu_match.group(1).strip(),
+                'duration': edu_match.group(2).strip(),
+                'degree': edu_match.group(3).strip()
+            })
+
+    structured_data = {
+        "resume_id": job_id,
+        "raw_text": doc_content,
+        "extracted_on": datetime.utcnow().isoformat(),
+        "emails": emails,
+        "phone_numbers": phone_numbers,
+        "skills": skills,
+        "experience": experience,
+        "education": education
+    }
+
+    # Store JSON in S3
+    output_key = f"{PROCESSED_FOLDER}{job_id}.json"
+    try:
+        s3.put_object(Bucket=OUTPUT_BUCKET, Key=output_key, Body=json.dumps(structured_data))
+        print(f"Stored processed JSON at s3://{OUTPUT_BUCKET}/{output_key}")
+    except Exception as e:
+        print(f"Error storing JSON in S3: {e}")
+
+    # Log in DynamoDB
+    try:
+        table = dynamodb.Table(DDB_TABLE_NAME)
+        table.put_item(
+            Item={
+                'resume_id': job_id,
+                'processed_on': datetime.utcnow().isoformat(),
+                'status': 'success',
+                'emails': emails,
+                'phone_numbers': phone_numbers,
+                'skills': skills,
+                'experience': experience,
+                'education': education
+            }
+        )
+    except Exception as e:
+        print(f"Error writing to DynamoDB: {e}")
+
+    print(f"Textract job {job_id} processed successfully")
+    return {"status": "processed"}
+
+# --- Utility functions ---
+def extract_emails(text):
+    return re.findall(r'\S+@\S+', text)
+
+def extract_phone_numbers(text):
+    return re.findall(r'\+?\d[\d -]{8,}\d', text)

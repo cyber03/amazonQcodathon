@@ -1,0 +1,105 @@
+import json
+import boto3
+
+# DynamoDB client
+dynamodb = boto3.resource("dynamodb")
+TABLE_NAME = "ResumeRanking"  # DynamoDB table name
+
+# Mapping query keywords to score ranges
+MATCH_RANGES = {
+    "strong": (0.8, 1.0),
+    "good": (0.6, 0.8),
+    "partial": (0.4, 0.6),
+    "low": (0.0, 0.4),
+    "all": (0.0, 1.0)
+}
+
+def lambda_handler(event, context):
+    try:
+        # Extract metadata for response wrapper
+        agent_name = event.get('agent', {}).get('name', 'get-me-candidate')
+        action_group = event.get('actionGroup', 'fetcher-action-group')
+        api_path = event.get('apiPath', '/fetch-candidates')
+        http_method = event.get('httpMethod', 'POST')
+        request_body = event.get('requestBody', {})
+
+        # Parse structured requestBody for OpenAPI-style input
+        if isinstance(request_body, str):
+            request_body = json.loads(request_body)
+        query_text = None
+
+        try:
+            content = request_body.get("content", {})
+            json_content = content.get("application/json", {})
+            properties = json_content.get("properties", [])
+            for prop in properties:
+                if prop.get("name") == "queryText":
+                    query_text = prop.get("value", "").strip()
+                    break
+        except Exception:
+            query_text = request_body.get("queryText", "").strip()
+
+        if not query_text:
+            response_body = {
+                "application/json": {
+                    "body": "Missing required property: queryText"
+                }
+            }
+        else:
+            # Determine requested match level
+            match_level = "good"
+            for key in MATCH_RANGES.keys():
+                if key in query_text.lower():
+                    match_level = key
+                    break
+
+            score_min, score_max = MATCH_RANGES[match_level]
+
+            # Scan DynamoDB table
+            table = dynamodb.Table(TABLE_NAME)
+            items = table.scan().get("Items", [])
+
+            # Filter candidates within score range
+            filtered_candidates = [
+                {
+                    "candidate_name": item.get("candidate_name", "Unknown"),
+                    "score": float(item.get("score", 0)),
+                    "match_level": match_level.capitalize()
+                }
+                for item in items
+                if score_min <= float(item.get("score", 0)) <= score_max
+            ]
+
+            # Sort by descending score, top 5 only
+            top_candidates = sorted(filtered_candidates, key=lambda x: x["score"], reverse=True)[:5]
+
+            # Construct nested response
+            response_body = {
+                "application/json": {
+                    "body": {
+                        "query": query_text,
+                        "requested_match_level": match_level,
+                        "top_candidates": top_candidates
+                    }
+                }
+            }
+
+        # Return structured response
+        return {
+            "response": {
+                "actionGroup": action_group,
+                "apiPath": api_path,
+                "httpMethod": http_method,
+                "httpStatusCode": 200,
+                "responseBody": response_body
+            },
+            "messageVersion": event.get("messageVersion", "1.0")
+        }
+
+    except Exception as e:
+        print("Error in lambda_handler:", str(e))
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": str(e)})
+        }

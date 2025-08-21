@@ -1,0 +1,54 @@
+import boto3
+from datetime import datetime
+import json
+
+# Initialize AWS clients
+s3 = boto3.client('s3')
+sns = boto3.client('sns')
+dynamodb = boto3.resource('dynamodb')
+
+# Hardcoded SNS topic ARN and DynamoDB table name
+SNS_TOPIC_ARN = "arn:aws:sns:us-east-1:630610926728:NewResumeTopic"
+DDB_TABLE_NAME = "ResumeUploads"
+
+def lambda_handler(event, context):
+    record = event['Records'][0]
+    bucket = record['s3']['bucket']['name']
+    key = record['s3']['object']['key']
+    
+    # --- Step 1: Validate file type ---
+    if not key.lower().endswith(('.pdf', '.docx', '.txt')):
+        print(f"Invalid file type: {key}")
+        copy_source = {'Bucket': bucket, 'Key': key}
+        s3.copy_object(CopySource=copy_source, Bucket=bucket, Key="invalid-resumes/" + key.split("/")[-1])
+        s3.delete_object(Bucket=bucket, Key=key)
+        return {"status": "Invalid file type"}
+    
+    print(f"File {key} passed validation")
+    
+    # --- Step 2: Publish message to SNS ---
+    message = {
+        "file_name": key,
+        "s3_bucket": bucket,
+        "status": "validated",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    sns.publish(
+        TopicArn=SNS_TOPIC_ARN,
+        Message=json.dumps(message)
+    )
+    print(f"Notified agents via SNS for file: {key}")
+    
+    # --- Step 3: Log validated resume in DynamoDB ---
+    table = dynamodb.Table(DDB_TABLE_NAME)
+    table.put_item(
+        Item={
+            'resume_id': key,
+            'upload_time': datetime.utcnow().isoformat(),
+            'status': 'validated'
+        }
+    )
+    print(f"Logged resume {key} in DynamoDB")
+    
+    return {"status": "Valid"}
+s

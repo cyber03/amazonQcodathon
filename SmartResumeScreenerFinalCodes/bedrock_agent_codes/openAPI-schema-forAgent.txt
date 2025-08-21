@@ -1,0 +1,113 @@
+openapi: 3.0.1
+info:
+  title: Candidate Fetcher Agent API
+  description: Fetch top candidates from DynamoDB based on score and query keywords.
+  version: 1.0.0
+  x-agent-name: get-me-candidate
+  x-action-group: fetcher-action-group
+
+paths:
+
+  /fetch-candidates:
+    post:
+      summary: Fetch top candidates
+      description: |
+        Accepts a query string to find candidates matching a score range (strong, good, partial, low, all).
+        Returns top candidates sorted by score with match level.
+      operationId: fetchCandidates
+      x-lambda-function: fetch-candidates-lambda-fx
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                queryText:
+                  type: string
+                  description: Query string to find candidates (e.g., "get me good candidate name")
+              required:
+                - queryText
+      responses:
+        "200":
+          description: Top candidates returned successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  response:
+                    type: object
+                    properties:
+                      actionGroup:
+                        type: string
+                        description: Action group that processed the request
+                        example: fetcher-action-group
+                      apiPath:
+                        type: string
+                        description: API endpoint called
+                        example: /fetch-candidates
+                      httpMethod:
+                        type: string
+                        example: POST
+                      httpStatusCode:
+                        type: integer
+                        example: 200
+                      responseBody:
+                        type: object
+                        properties:
+                          application/json:
+                            type: object
+                            properties:
+                              body:
+                                type: object
+                                properties:
+                                  query:
+                                    type: string
+                                    description: Original query text
+                                    example: "get me good candidate name"
+                                  requested_match_level:
+                                    type: string
+                                    description: Match level extracted from query
+                                    enum: [strong, good, partial, low, all]
+                                  top_candidates:
+                                    type: array
+                                    description: List of top candidates sorted by score
+                                    items:
+                                      type: object
+                                      properties:
+                                        candidate_name:
+                                          type: string
+                                        score:
+                                          type: number
+                                          format: float
+                                        match_level:
+                                          type: string
+        "400":
+          description: Missing input or bad request.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  response:
+                    type: object
+                    properties:
+                      responseBody:
+                        type: object
+                        properties:
+                          application/json:
+                            type: object
+                            properties:
+                              body:
+                                type: string
+                                example: "Missing required property: queryText"
+        "500":
+          description: Internal processing error.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string

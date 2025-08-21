@@ -1,0 +1,96 @@
+import json
+import boto3
+import os
+import math
+
+# AWS clients
+s3 = boto3.client("s3")
+dynamodb = boto3.resource("dynamodb")
+bedrock = boto3.client("bedrock-runtime")
+
+# DynamoDB table name
+TABLE_NAME = os.environ.get("DDB_TABLE_NAME", "ResumeRanking")
+JOB_DESC_BUCKET = os.environ.get("JOB_DESC_BUCKET", "job-description-s3bucket")
+JOB_DESC_KEY = os.environ.get("JOB_DESC_KEY", "job-description.txt")
+
+def lambda_handler(event, context):
+    try:
+        # 1. Get uploaded resume from S3 event
+        bucket = event['Records'][0]['s3']['bucket']['name']
+        key = event['Records'][0]['s3']['object']['key']
+
+        print(f"Processing resume from {bucket}/{key}")
+
+        resume_obj = s3.get_object(Bucket=bucket, Key=key)
+        resume_json = json.loads(resume_obj['Body'].read().decode("utf-8"))
+        resume_id = resume_json.get("resume_id")
+        resume_text = resume_json.get("raw_text")
+        candidate_name = extract_candidate_name(resume_text)
+
+        # 2. Fetch Job Description
+        job_desc_obj = s3.get_object(Bucket=JOB_DESC_BUCKET, Key=JOB_DESC_KEY)
+        job_desc = job_desc_obj['Body'].read().decode("utf-8")
+
+        # 3. Generate embeddings for both
+        resume_emb = get_embedding(resume_text)
+        job_emb = get_embedding(job_desc)
+
+        # 4. Compute cosine similarity
+        score = cosine_similarity(resume_emb, job_emb)
+
+        # 5. Determine match level
+        match_level = get_match_level(score)
+
+        # 6. Store result in DynamoDB
+        table = dynamodb.Table(TABLE_NAME)
+        table.put_item(
+            Item={
+                "resume_id": resume_id,
+                "candidate_name": candidate_name,
+                "score": str(score),
+                "match_level": match_level
+            }
+        )
+
+        return {"status": "success", "resume_id": resume_id, "score": score, "match_level": match_level}
+
+    except Exception as e:
+        print("Error:", str(e))
+        raise e
+
+def get_embedding(text: str):
+    """Generate embeddings from Bedrock Titan model"""
+    response = bedrock.invoke_model(
+        modelId="amazon.titan-embed-text-v1",
+        body=json.dumps({"inputText": text})
+    )
+    result = json.loads(response["body"].read())
+    return result["embedding"]
+
+def cosine_similarity(vec1, vec2):
+    """Compute cosine similarity between two vectors"""
+    dot = sum(a*b for a, b in zip(vec1, vec2))
+    norm1 = math.sqrt(sum(a*a for a in vec1))
+    norm2 = math.sqrt(sum(b*b for b in vec2))
+    return dot / (norm1 * norm2)
+
+def get_match_level(score):
+    """Return textual match level based on score"""
+    if score > 0.8:
+        return "Strong"
+    elif 0.6 < score <= 0.8:
+        return "Good"
+    elif 0.4 < score <= 0.6:
+        return "Partial"
+    else:
+        return "Low"
+
+def extract_candidate_name(text):
+    """Simple heuristic to get candidate name (first line before 'DATA ENGINEER' or comma)"""
+    lines = text.splitlines()
+    if lines:
+        first_line = lines[0].strip()
+        # take the part before first comma as name if exists
+        name = first_line.split(',')[0]
+        return name
+    return "Unknown"
